@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>GPU Voice Chat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at 30% 10%, #1a223d 0%, #0a0e1c 70%);
+    color: #e6e9f2; min-height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 20px 28px; border-bottom: 1px solid #1f2740;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .5px; font-weight: 600; }
+  header .pill { font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: #1c2742; color: #9fb0d6; border: 1px solid #2a3658; }
+  main { flex: 1; padding: 28px; max-width: 920px; width: 100%; box-sizing: border-box;
+         margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  button {
+    padding: 12px 20px; border-radius: 10px; border: 1px solid #2c375a;
+    background: #1a2240; color: #e6e9f2; cursor: pointer; font-size: 14px;
+  }
+  button.primary { background: #3b6df0; border-color: #3b6df0; color: white; font-weight: 600; }
+  button.primary:hover { background: #2f5cd8; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .meter { height: 8px; flex: 1; background: #161c30; border-radius: 4px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg,#3b6df0,#7b3bf0); transition: width .08s linear; }
+  .panel { background: #11172a; border: 1px solid #1d2540; border-radius: 14px; padding: 18px; }
+  .label { font-size: 11px; color: #6b7da3; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .text { font-size: 16px; line-height: 1.45; min-height: 24px; white-space: pre-wrap; word-wrap: break-word; }
+  .you .text { color: #c0d4ff; }
+  .bot .text { color: #d6f3d6; }
+  .partial { opacity: .55; font-style: italic; }
+  .hint { color: #6b7da3; font-size: 13px; }
+  kbd { background: #1d2540; padding: 2px 7px; border-radius: 5px; font-size: 12px; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; color: #6b7da3; max-height: 120px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GPU Voice Chat</h1>
+  <span class="pill" id="status">disconnected</span>
+</header>
+<main>
+  <div class="row">
+    <button class="primary" id="start">Start mic</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="reset">Reset chat</button>
+    <div class="meter"><i id="vu"></i></div>
+  </div>
+  <p class="hint">
+    Speak normally. Partial transcripts stream into the LLM to keep its KV cache warm.
+    End your turn with the word <kbd>go</kbd> to trigger a spoken reply.
+  </p>
+  <div class="panel you">
+    <div class="label">You</div>
+    <div class="text" id="user-text">—</div>
+  </div>
+  <div class="panel bot">
+    <div class="label">Assistant</div>
+    <div class="text" id="bot-text">—</div>
+  </div>
+  <div class="panel">
+    <div class="label">Activity</div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const $status = document.getElementById('status');
+const $start = document.getElementById('start');
+const $stop = document.getElementById('stop');
+const $reset = document.getElementById('reset');
+const $vu = document.getElementById('vu');
+const $user = document.getElementById('user-text');
+const $bot = document.getElementById('bot-text');
+const $log = document.getElementById('log');
+
+const TARGET_SR_IN = 16000;
+const SR_OUT = 24000;
+
+let ws = null;
+let audioCtx = null;
+let micStream = null;
+let captureNode = null;
+let playbackCtx = null;
+let playbackTime = 0;
+
+// Speculative-audio buffers, keyed by spec_id. Each chunk is a Float32Array.
+// While a spec is "pending" (server has not released it), incoming PCM goes
+// into pending[id]. On spec_release, we drain pending[id] into the audio graph
+// AND mark id as live, so subsequent chunks for that id schedule immediately.
+const pendingBySpec = new Map();    // spec_id -> Float32Array[]
+let liveSpecId = null;              // currently-playing spec
+let liveSources = [];               // AudioBufferSourceNodes scheduled for live spec
+
+function logLine(s) {
+  const ts = new Date().toLocaleTimeString();
+  $log.innerHTML = `[${ts}] ${s}<br>` + $log.innerHTML;
+}
+
+function setStatus(s) { $status.textContent = s; }
+
+async function start() {
+  $start.disabled = true; $stop.disabled = false;
+  setStatus('connecting…');
+
+  // playback context (24kHz)
+  playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR_OUT });
+  playbackTime = playbackCtx.currentTime;
+
+  // capture context (browser default rate, we resample in worklet)
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const workletURL = URL.createObjectURL(new Blob([CAPTURE_WORKLET], {type: 'application/javascript'}));
+  await audioCtx.audioWorklet.addModule(workletURL);
+
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+    echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+  }});
+  const src = audioCtx.createMediaStreamSource(micStream);
+  captureNode = new AudioWorkletNode(audioCtx, 'capture', {
+    processorOptions: { srcRate: audioCtx.sampleRate, dstRate: TARGET_SR_IN }
+  });
+
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setStatus('listening'); logLine('connected'); };
+  ws.onclose = () => { setStatus('disconnected'); logLine('disconnected'); };
+  ws.onerror = (e) => { logLine('ws error'); };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const m = JSON.parse(ev.data);
+      handleControl(m);
+    } else {
+      handleAudioFrame(ev.data);  // [4-byte LE spec_id][int16 PCM @ 24k]
+    }
+  };
+
+  captureNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === 1 && e.data.pcm) {
+      ws.send(e.data.pcm);
+      $vu.style.width = Math.min(100, Math.round(e.data.rms * 400)) + '%';
+    }
+  };
+
+  src.connect(captureNode);
+  // do not connect captureNode -> destination (avoid echo)
+}
+
+function handleControl(m) {
+  switch (m.type) {
+    case 'ready': logLine('server ready'); break;
+    case 'user_partial':
+      $user.textContent = m.text;
+      $user.classList.add('partial');
+      break;
+    case 'user_final':
+      $user.textContent = m.text;
+      $user.classList.remove('partial');
+      logLine('user: ' + m.text);
+      break;
+    case 'spec_start':
+      pendingBySpec.set(m.id, []);
+      logLine(`spec ${m.id} start: ${m.text}`);
+      break;
+    case 'spec_cancel':
+      pendingBySpec.delete(m.id);
+      // a cancelled spec is never the live one (we only release stable specs)
+      logLine(`spec ${m.id} cancel`);
+      break;
+    case 'spec_release':
+      releaseSpec(m.id);
+      logLine(`spec ${m.id} release`);
+      break;
+    case 'assistant_start':
+      $bot.textContent = '';
+      $bot.classList.add('partial');
+      setStatus('speaking…');
+      break;
+    case 'assistant_partial':
+      $bot.textContent = m.text;
+      break;
+    case 'assistant_final':
+      $bot.textContent = m.text;
+      $bot.classList.remove('partial');
+      setStatus('listening');
+      logLine('assistant: ' + m.text);
+      // playback finishes naturally; let next turn start fresh
+      liveSpecId = null;
+      liveSources = [];
+      break;
+    case 'reset_ok':
+      $user.textContent = '—'; $bot.textContent = '—';
+      pendingBySpec.clear();
+      stopLive();
+      logLine('reset'); break;
+    case 'error':
+      logLine('error: ' + m.message); break;
+  }
+}
+
+function handleAudioFrame(arrayBuffer) {
+  const dv = new DataView(arrayBuffer);
+  const specId = dv.getUint32(0, true);
+  const i16 = new Int16Array(arrayBuffer, 4);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+  if (specId === liveSpecId) {
+    schedulePCM(f32);
+  } else if (pendingBySpec.has(specId)) {
+    pendingBySpec.get(specId).push(f32);
+  }
+  // unknown spec_id (already cancelled): drop on the floor
+}
+
+function releaseSpec(specId) {
+  // stop anything from a prior live spec (rare)
+  stopLive();
+  liveSpecId = specId;
+  // schedule everything we have buffered for this spec, in order
+  const queue = pendingBySpec.get(specId) || [];
+  pendingBySpec.delete(specId);
+  // reset the playback clock so audio starts NOW (don't pile onto stale time)
+  playbackTime = playbackCtx.currentTime + 0.02;
+  for (const f32 of queue) schedulePCM(f32);
+}
+
+function schedulePCM(f32) {
+  const buf = playbackCtx.createBuffer(1, f32.length, SR_OUT);
+  buf.getChannelData(0).set(f32);
+  const src = playbackCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playbackCtx.destination);
+  const now = playbackCtx.currentTime;
+  if (playbackTime < now + 0.02) playbackTime = now + 0.02;
+  src.start(playbackTime);
+  playbackTime += buf.duration;
+  liveSources.push(src);
+  src.onended = () => {
+    const i = liveSources.indexOf(src);
+    if (i >= 0) liveSources.splice(i, 1);
+  };
+}
+
+function stopLive() {
+  for (const s of liveSources) { try { s.stop(); } catch {} }
+  liveSources = [];
+  liveSpecId = null;
+}
+
+function stop() {
+  if (captureNode) { try { captureNode.disconnect(); } catch {} }
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  if (ws) ws.close();
+  $start.disabled = false; $stop.disabled = true;
+  setStatus('disconnected');
+}
+
+$start.addEventListener('click', start);
+$stop.addEventListener('click', stop);
+$reset.addEventListener('click', () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:'reset'}));
+});
+
+// AudioWorklet: resample to 16k mono float32, ship 320-sample (20ms) frames
+const CAPTURE_WORKLET = `
+class Capture extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.srcRate = opts.processorOptions.srcRate;
+    this.dstRate = opts.processorOptions.dstRate;
+    this.ratio = this.srcRate / this.dstRate;
+    this.outBuf = [];
+    this.frameSize = 320; // 20ms @ 16k
+    this._pos = 0;
+  }
+  process(inputs) {
+    const inp = inputs[0];
+    if (!inp || !inp[0]) return true;
+    const ch = inp[0]; // mono
+    // simple linear resample
+    const outLen = Math.floor(ch.length / this.ratio);
+    const out = new Float32Array(outLen);
+    let rms = 0;
+    for (let i = 0; i < outLen; i++) {
+      const s = i * this.ratio;
+      const i0 = Math.floor(s), i1 = Math.min(ch.length-1, i0+1);
+      const t = s - i0;
+      const v = ch[i0]*(1-t) + ch[i1]*t;
+      out[i] = v;
+      rms += v*v;
+    }
+    rms = Math.sqrt(rms / Math.max(1,outLen));
+    this.outBuf.push(out);
+
+    let total = this.outBuf.reduce((a,b)=>a+b.length, 0);
+    while (total >= this.frameSize) {
+      const frame = new Float32Array(this.frameSize);
+      let written = 0;
+      while (written < this.frameSize) {
+        const head = this.outBuf[0];
+        const need = this.frameSize - written;
+        if (head.length <= need) {
+          frame.set(head, written); written += head.length; this.outBuf.shift();
+        } else {
+          frame.set(head.subarray(0, need), written);
+          this.outBuf[0] = head.subarray(need); written += need;
+        }
+      }
+      total -= this.frameSize;
+      this.port.postMessage({ pcm: frame.buffer, rms }, [frame.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);
+`;
+</script>
+</body>
+</html>
