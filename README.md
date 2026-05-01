@@ -2,9 +2,7 @@
 
 A streaming GPU voice assistant. Talk to it, end your turn with the word **`go`**, and it talks back. Every stage streams: STT pushes partial transcripts into the LLM, the LLM streams tokens into the TTS, and TTS audio is shipped to the browser as it's synthesized — even before you've finished talking.
 
-<video src="https://raw.githubusercontent.com/Conscious-Cut/InstantAssistant/main/IMG_2129.mp4" controls muted playsinline width="720"></video>
-
-[(direct download)](https://raw.githubusercontent.com/Conscious-Cut/InstantAssistant/main/IMG_2129.mp4)
+https://github.com/Conscious-Cut/InstantAssistant/releases/download/demo/demo.mp4
 
 ## Pipeline
 
